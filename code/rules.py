@@ -12,6 +12,7 @@ class DetectionEngine:
         sudo_window_seconds=120,
         business_hours_start=8,
         business_hours_end=18,
+        alert_cooldown_seconds=300,
     ):
         self.brute_force_threshold = brute_force_threshold
         self.brute_force_window = timedelta(seconds=brute_force_window_seconds)
@@ -24,11 +25,29 @@ class DetectionEngine:
         self.business_hours_start = business_hours_start
         self.business_hours_end = business_hours_end
 
+        self.alert_cooldown = timedelta(seconds=alert_cooldown_seconds)
+
         # Rolling state
         self.failed_by_ip = defaultdict(deque)              # ip -> deque[timestamp]
         self.failed_users_by_ip = defaultdict(deque)        # ip -> deque[(timestamp, username)]
         self.sudo_commands_by_user = defaultdict(deque)     # user -> deque[timestamp]
+        # Alert suppression state
+        self.last_alert_time = {}
 
+    def _should_alert(self, rule_name, entity_key, current_time):
+        """
+        Return True if enough time has passed since the last alert
+        for this rule/entity combination.
+        """
+        suppression_key = (rule_name, entity_key)
+        last_time = self.last_alert_time.get(suppression_key)
+
+        if last_time is None or current_time - last_time > self.alert_cooldown:
+            self.last_alert_time[suppression_key] = current_time
+            return True
+
+        return False
+    
     def _prune_old(self, dq, current_time, window):
         while dq and current_time - dq[0][0] > window if isinstance(dq[0], tuple) else current_time - dq[0] > window:
             dq.popleft()
@@ -75,6 +94,9 @@ class DetectionEngine:
             dq.popleft()
 
         if len(dq) >= self.brute_force_threshold:
+            if not self._should_alert("brute_force", ip, ts):
+                return []
+
             return [{
                 "timestamp": ts.isoformat(),
                 "rule": "brute_force",
@@ -103,6 +125,9 @@ class DetectionEngine:
         unique_users = {user for _, user in dq}
 
         if len(unique_users) >= self.credential_stuffing_user_threshold:
+            if not self._should_alert("credential_stuffing", ip, ts):
+                return []
+
             return [{
                 "timestamp": ts.isoformat(),
                 "rule": "credential_stuffing",
@@ -137,6 +162,9 @@ class DetectionEngine:
             dq.popleft()
 
         if dq:
+            if not self._should_alert("privilege_escalation", username, ts):
+                return None
+
             return {
                 "timestamp": ts.isoformat(),
                 "rule": "privilege_escalation",
@@ -150,13 +178,16 @@ class DetectionEngine:
             }
 
         return None
-
+    
     def _check_off_hours_login(self, event):
         ts = event["timestamp"]
         ip = event["source_ip"]
         username = event["username"]
 
         if ts.hour < self.business_hours_start or ts.hour >= self.business_hours_end:
+            if not self._should_alert("off_hours_login", (username, ip), ts):
+                return None
+
             return {
                 "timestamp": ts.isoformat(),
                 "rule": "off_hours_login",
